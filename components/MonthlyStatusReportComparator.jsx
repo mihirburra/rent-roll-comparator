@@ -1,3 +1,5 @@
+"use client";
+
 import React, { useState, useCallback, useEffect, useRef } from "react";
 import * as XLSX from "xlsx";
 import { Upload, FileSpreadsheet, AlertTriangle, X, Plus, RotateCcw, Loader2, Search } from "lucide-react";
@@ -137,6 +139,71 @@ function scrubDeep(value) {
   }
   return value;
 }
+
+// Simple concurrency limiter so uploading several files doesn't fire a burst of simultaneous AI
+// calls (decision support + multi-year overview) all at once, which is a common cause of hitting
+// rate limits and every single one failing together.
+let activeAICalls = 0;
+const aiCallQueue = [];
+const AI_CONCURRENCY_LIMIT = 2;
+function runQueued(task) {
+  return new Promise((resolve, reject) => {
+    const run = async () => {
+      activeAICalls++;
+      try {
+        resolve(await task());
+      } catch (err) {
+        reject(err);
+      } finally {
+        activeAICalls--;
+        if (aiCallQueue.length > 0) aiCallQueue.shift()();
+      }
+    };
+    if (activeAICalls < AI_CONCURRENCY_LIMIT) run();
+    else aiCallQueue.push(run);
+  });
+}
+
+// Calls the Claude API with retry/backoff on transient failures (rate limit, overload, network
+// blip). Without this, a single 429/529 during a burst of concurrent calls just fails outright
+// with no second attempt, which reads as "wasn't available" for no visible reason.
+async function callClaudeText(prompt, maxTokens) {
+  return runQueued(async () => {
+    let lastErr = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        // This calls our own Next.js API route (app/api/claude/route.js), not Anthropic directly.
+        // The route holds the real API key server-side and proxies the request \u2014 see that file
+        // for why this can't just call api.anthropic.com from the browser on a plain Vercel deploy.
+        const response = await fetch("/api/claude", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            maxTokens: maxTokens || 1000,
+            messages: [{ role: "user", content: prompt }],
+          }),
+        });
+        if (!response.ok) {
+          const retryable = response.status === 429 || response.status === 529 || response.status >= 500;
+          let detail = "";
+          try { detail = JSON.stringify(await response.json()); } catch (e) { /* ignore */ }
+          const err = new Error(`API returned ${response.status}${detail ? ": " + detail : ""}`);
+          if (retryable && attempt < 2) { lastErr = err; await new Promise((r) => setTimeout(r, 600 * Math.pow(2, attempt))); continue; }
+          throw err;
+        }
+        const data = await response.json();
+        const textBlock = (data.content || []).find((b) => b.type === "text");
+        if (!textBlock) throw new Error("No text in response");
+        return textBlock.text;
+      } catch (err) {
+        lastErr = err;
+        if (attempt < 2) { await new Promise((r) => setTimeout(r, 600 * Math.pow(2, attempt))); continue; }
+      }
+    }
+    throw lastErr || new Error("Request failed");
+  });
+}
+
 function firstNonEmpty(row) {
   if (!row) return "";
   for (const c of row) if (norm(c) !== "") return c;
@@ -707,7 +774,7 @@ function DecisionSupportCard({ decision, onRetry }) {
           )}
           {decision.status === "error" && (
             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <span style={{ fontSize: 12, color: SLATE }}>Not available.</span>
+              <span style={{ fontSize: 12, color: SLATE }} title={decision.errorMessage || undefined}>Not available.</span>
               <button onClick={onRetry} style={{ background: "transparent", border: `1px solid ${BORDER}`, color: INK, borderRadius: 6, padding: "3px 9px", fontSize: 11, cursor: "pointer" }}>Retry</button>
             </div>
           )}
@@ -744,8 +811,11 @@ function PropertyOverviewCard({ overview, onRetry }) {
   }
   if (overview.status === "error") {
     return (
-      <div style={{ background: CARD, border: `0.5px solid ${BORDER}`, borderRadius: 12, padding: "1.1rem 1.5rem", marginBottom: 28, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
-        <span style={{ fontSize: 13, color: SLATE }}>Multi-year performance report wasn't available.</span>
+      <div style={{ background: CARD, border: `0.5px solid ${BORDER}`, borderRadius: 12, padding: "1.1rem 1.5rem", marginBottom: 28, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+        <div>
+          <div style={{ fontSize: 13, color: SLATE }}>Multi-year performance report wasn't available.</div>
+          {overview.errorMessage && <div style={{ fontSize: 11, color: SLATE, marginTop: 3, fontFamily: "'IBM Plex Mono', monospace" }}>{overview.errorMessage}</div>}
+        </div>
         <button onClick={onRetry} style={{ background: "transparent", border: `1px solid ${BORDER}`, color: INK, borderRadius: 6, padding: "6px 12px", fontSize: 12, cursor: "pointer" }}>Retry</button>
       </div>
     );
@@ -873,19 +943,8 @@ Each bullet should read like a terse analyst note, not a sentence in a paragraph
 
 If yieldOnCostAndNOIMayBeDistortedByFlaggedMonth is true, add a bullet in whyItChanged noting the YTD NOI/yield-on-cost figure includes a flagged month and should be sanity-checked before relying on it.`;
 
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: "claude-sonnet-4-6",
-          max_tokens: 1000,
-          messages: [{ role: "user", content: prompt }],
-        }),
-      });
-      const data = await response.json();
-      const textBlock = (data.content || []).find((b) => b.type === "text");
-      if (!textBlock) throw new Error("No text in response");
-      const cleaned = textBlock.text.replace(/```json|```/g, "").trim();
+      const responseText = await callClaudeText(prompt, 1000);
+      const cleaned = responseText.replace(/```json|```/g, "").trim();
       const parsed = scrubDeep(JSON.parse(cleaned));
       // Backtest: cross-check the AI's "shouldICare" against the hard, rule-based flags we already
       // trust. If the model said "No action needed" on a month that actually has a data-quality or
@@ -896,7 +955,7 @@ If yieldOnCostAndNOIMayBeDistortedByFlaggedMonth is true, add a bullet in whyItC
         : null;
       setDecisions((prev) => ({ ...prev, [rep.id]: { status: "done", whatChanged, data: parsed } }));
     } catch (err) {
-      setDecisions((prev) => ({ ...prev, [rep.id]: { status: "error", whatChanged } }));
+      setDecisions((prev) => ({ ...prev, [rep.id]: { status: "error", whatChanged, errorMessage: err && err.message } }));
     }
   }, []);
 
@@ -940,19 +999,8 @@ Respond with ONLY a raw JSON object, no markdown fences, no commentary, with exa
 
 Each bullet should read like a terse analyst note, not a sentence in a paragraph \u2014 short, direct, every specific number/dollar figure/percent kept, no throat-clearing. Never use the term "cap rate" \u2014 use "yield on cost".`;
 
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: "claude-sonnet-4-6",
-          max_tokens: 1000,
-          messages: [{ role: "user", content: prompt }],
-        }),
-      });
-      const data = await response.json();
-      const textBlock = (data.content || []).find((b) => b.type === "text");
-      if (!textBlock) throw new Error("No text in response");
-      const cleaned = textBlock.text.replace(/```json|```/g, "").trim();
+      const responseText = await callClaudeText(prompt, 1000);
+      const cleaned = responseText.replace(/```json|```/g, "").trim();
       const parsed = scrubDeep(JSON.parse(cleaned));
       // Backtest: check the AI's verdict against the actual NOI trend across the uploaded years,
       // rather than trusting the label at face value.
@@ -965,7 +1013,7 @@ Each bullet should read like a terse analyst note, not a sentence in a paragraph
       }
       setPropertyOverviews((prev) => ({ ...prev, [groupKey]: { status: "done", data: parsed } }));
     } catch (err) {
-      setPropertyOverviews((prev) => ({ ...prev, [groupKey]: { status: "error" } }));
+      setPropertyOverviews((prev) => ({ ...prev, [groupKey]: { status: "error", errorMessage: err && err.message } }));
     }
   }, []);
 
